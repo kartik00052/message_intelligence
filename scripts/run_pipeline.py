@@ -32,6 +32,7 @@ TASKS_EVENTS_FILENAME = "tasks_events.json"
 SENSITIVE_FILENAME = "sensitive_detections.json"
 FINAL_RESULTS_FILENAME = "final_results.json"
 VALIDATION_REPORT_FILENAME = "validation_report.json"
+SUMMARY_STATISTICS_FILENAME = "summary_statistics.json"
 
 
 def build_classifications_payload(
@@ -97,6 +98,34 @@ def build_validation_payload(
     }
 
 
+def build_summary_statistics_payload(
+    *,
+    run: PipelineRunResult,
+    report: QualityReport,
+    mandatory_processed: int,
+) -> dict[str, object]:
+    """Build the machine-readable ``summary_statistics.json`` document.
+
+    Aggregate statistics only - no message text and no sensitive values.
+    """
+    summary = run.summary
+    return {
+        "generated_at": _now(),
+        "total_messages": summary.total_messages,
+        "classified_messages": summary.classified_messages,
+        "sensitive_messages": summary.messages_with_sensitive,
+        "task_event_count": summary.total_extracted_items,
+        "items_by_type": summary.items_by_type,
+        "rule_based_classifications": summary.rule_based_classifications,
+        "llm_fallback_classifications": summary.llm_fallback_classifications,
+        "failures": summary.failures,
+        "processing_duration_seconds": summary.processing_duration_seconds,
+        "mandatory_processed": mandatory_processed,
+        "validation_status": report.validation_status,
+        "leak_check": report.sensitive_value_leak_check,
+    }
+
+
 def write_json(path: Path, payload: dict[str, object]) -> None:
     """Write a JSON artifact atomically (tmp file + rename)."""
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -139,7 +168,7 @@ def run(
         expected_count=settings.expected_mandatory_count,
     )
     mandatory_service = MandatoryDemoService(mandatory_ids)
-    mandatory_service.check(
+    mandatory_check = mandatory_service.check(
         dataset_ids=expected_ids,
         processed_ids=expected_ids,
         classified_ids=[str(record["message_id"]) for record in _records(classifications_path)],
@@ -169,6 +198,16 @@ def run(
     write_json(
         outputs_dir / VALIDATION_REPORT_FILENAME,
         build_validation_payload(run=run_result, report=report, leak_scan=leak_scan),
+    )
+    # Aggregate-only statistics (no message text), written after the leak scan
+    # that covers the four content-bearing artifacts.
+    write_json(
+        outputs_dir / SUMMARY_STATISTICS_FILENAME,
+        build_summary_statistics_payload(
+            run=run_result,
+            report=report,
+            mandatory_processed=mandatory_check.unique_count,
+        ),
     )
     return run_result, report, leak_scan
 
@@ -203,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"LLM failures: {summary.failures}")
     print(f"Processing duration: {summary.processing_duration_seconds}s")
     print(f"Artifacts written to: {settings.outputs_dir}")
+    print(f"Summary statistics written to: {settings.outputs_dir / SUMMARY_STATISTICS_FILENAME}")
     print(
         "Mandatory demo: "
         f"{report.mandatory_messages_found} found / "

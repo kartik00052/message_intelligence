@@ -111,6 +111,7 @@ def _final_result(message_id: str, timestamp: datetime) -> FinalMessageResult:
         message_id=message_id,
         timestamp=timestamp,
         sender="Meera",
+        safe_message=f"Safe text for {message_id}.",
         classification=ClassificationResult(
             message_id=message_id,
             category=Category.ACTION_REQUIRED,

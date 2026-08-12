@@ -68,6 +68,7 @@ def final_result(message_id: str = "MSG_0001") -> dict[str, Any]:
         "message_id": message_id,
         "timestamp": "2026-09-01T08:00:00",
         "sender": "Meera",
+        "safe_message": "Safe masked text.",
         "classification": classification(message_id),
         "security": sensitive_result(message_id),
         "extracted_items": [],

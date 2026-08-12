@@ -137,12 +137,13 @@ class TestFinalResults:
             "message_id",
             "timestamp",
             "sender",
+            "safe_message",
             "classification",
             "security",
             "extracted_items",
         }
         assert "message" not in dumped
-        assert "safe_message" not in dumped
+        assert "safe_message" in dumped
 
     def test_final_results_preserve_dataset_order(self) -> None:
         dataset = load_messages_csv(Settings().messages_csv_path)

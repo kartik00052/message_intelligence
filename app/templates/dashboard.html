@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · Message Intelligence{% endblock %}
+
+{% block content %}
+<nav class="section-nav" aria-label="Dashboard sections">
+  <a href="#overview">Overview</a>
+  <a href="#messages">Messages</a>
+  <a href="#sensitive">Sensitive</a>
+  <a href="#mandatory">Mandatory Demo</a>
+  <a href="#validation">Validation</a>
+</nav>
+
+<section class="card" id="overview">
+  <h2>Overview</h2>
+  <div class="cards" id="summary-cards" data-loading="Loading statistics…">
+    <div class="stat-card"><span class="stat-value" id="stat-total">—</span><span class="stat-label">Messages</span></div>
+    <div class="stat-card"><span class="stat-value" id="stat-classified">—</span><span class="stat-label">Classified</span></div>
+    <div class="stat-card"><span class="stat-value" id="stat-tasks">—</span><span class="stat-label">Tasks &amp; Events</span></div>
+    <div class="stat-card"><span class="stat-value" id="stat-sensitive">—</span><span class="stat-label">Sensitive Messages</span></div>
+  </div>
+
+  <div class="pipeline-status" id="pipeline-status" data-loading="Loading pipeline status…">
+    <h3>Pipeline Status</h3>
+    <dl class="status-grid">
+      <div><dt>Messages</dt><dd id="status-messages">—</dd></div>
+      <div><dt>Processed</dt><dd id="status-processed">—</dd></div>
+      <div><dt>Validation</dt><dd id="status-validation">—</dd></div>
+      <div><dt>Sensitive</dt><dd id="status-sensitive">—</dd></div>
+      <div><dt>Tasks / Events</dt><dd id="status-tasks">—</dd></div>
+      <div><dt>Mandatory</dt><dd id="status-mandatory">—</dd></div>
+      <div><dt>Privacy Leak Check</dt><dd id="status-leak">—</dd></div>
+    </dl>
+  </div>
+</section>
+
+<section class="card" id="messages">
+  <h2>Messages</h2>
+  <div class="filters">
+    <input type="search" id="search-input" placeholder="Search message ID, sender, content…" aria-label="Search messages">
+    <select id="category-filter" aria-label="Category filter">
+      <option value="">All categories</option>
+      <option value="action_required">Action required</option>
+      <option value="meeting_or_event">Meeting or event</option>
+      <option value="personal_information">Personal information</option>
+      <option value="general_information">General information</option>
+      <option value="promotional">Promotional</option>
+      <option value="sensitive_information">Sensitive information</option>
+    </select>
+    <select id="sensitive-filter" aria-label="Sensitive filter">
+      <option value="">All messages</option>
+      <option value="true">Sensitive only</option>
+      <option value="false">Non-sensitive only</option>
+    </select>
+    <button type="button" id="apply-filters" class="btn">Apply</button>
+  </div>
+
+  <div id="message-table-wrap">
+    <p class="hint">Click a row to inspect the full (masked) message.</p>
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Message ID</th>
+          <th>Timestamp</th>
+          <th>Sender</th>
+          <th>Category</th>
+          <th>Confidence</th>
+          <th>Security</th>
+        </tr>
+      </thead>
+      <tbody id="message-rows"><tr class="empty-row"><td colspan="6">Loading…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="pagination" id="message-pagination" hidden>
+    <button type="button" id="page-prev" class="btn">‹ Prev</button>
+    <span id="page-info"></span>
+    <button type="button" id="page-next" class="btn">Next ›</button>
+  </div>
+
+  <div id="message-detail" class="detail-panel" hidden>
+    <h3 id="detail-title">Message detail</h3>
+    <div id="detail-body" data-loading="Loading message…"></div>
+  </div>
+</section>
+
+<section class="card" id="sensitive">
+  <h2>Sensitive Messages</h2>
+  <p class="hint">Only masked values are shown; raw values are never rendered.</p>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Message ID</th>
+        <th>Sensitivity Type</th>
+        <th>Risk</th>
+        <th>Masked Text</th>
+        <th>Recommended Action</th>
+      </tr>
+    </thead>
+    <tbody id="sensitive-rows"><tr class="empty-row"><td colspan="5">Loading…</td></tr></tbody>
+  </table>
+</section>
+
+<section class="card" id="mandatory">
+  <h2>Mandatory Demo <span class="badge" id="mandatory-count">15</span></h2>
+  <p class="hint">
+    The 15 messages required for the demo, loaded dynamically from
+    <code>mandatory_demo_ids.csv</code> in dataset order. Each card shows the
+    classification, confidence, extracted task/event and a masked-content
+    preview. Click a card to open the full detail below.
+  </p>
+  <div id="mandatory-list" class="mandatory-grid" data-loading="Loading mandatory messages…"></div>
+</section>
+
+<section class="card" id="validation">
+  <h2>Validation</h2>
+  <dl class="status-grid" id="validation-facts" data-loading="Loading validation…">
+    <div><dt>Processed</dt><dd id="val-processed">—</dd></div>
+    <div><dt>Missing IDs</dt><dd id="val-missing">—</dd></div>
+    <div><dt>Duplicates</dt><dd id="val-duplicates">—</dd></div>
+    <div><dt>Sensitive Leak</dt><dd id="val-leak">—</dd></div>
+    <div><dt>Overall</dt><dd id="val-status">—</dd></div>
+  </dl>
+  <div id="validation-issues"></div>
+</section>
+
+<noscript>
+  <div class="notice">This dashboard requires JavaScript to load the sanitized API data.</div>
+</noscript>
+{% endblock %}

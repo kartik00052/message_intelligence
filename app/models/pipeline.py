@@ -61,8 +61,8 @@ class MessagePipelineResult(BaseModel):
 class FinalMessageResult(BaseModel):
     """Sanitized final per-message result exposed to consumers.
 
-    Deliberately contains no raw message text and no raw sensitive value; only
-    the masked/structured representations are exposed.
+    Deliberately contains no raw sensitive value; ``safe_message`` is the fully
+    masked message text. Raw message content never appears in this model.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -70,6 +70,7 @@ class FinalMessageResult(BaseModel):
     message_id: str
     timestamp: datetime
     sender: str
+    safe_message: str
     classification: ClassificationResult
     security: MessageSensitiveResult
     extracted_items: tuple[ExtractedItem, ...] = ()
@@ -103,6 +104,7 @@ class PipelineRunResult(BaseModel):
                 message_id=result.message_id,
                 timestamp=result.timestamp,
                 sender=result.sender,
+                safe_message=result.safe_message,
                 classification=result.classification,
                 security=result.sensitive,
                 extracted_items=result.extraction.items,
