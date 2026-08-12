@@ -498,6 +498,12 @@ class MessageClassifier:
         self._rule_classifier = rule_classifier or RuleClassifier()
         self._llm = llm
         self._llm_confidence_threshold = llm_confidence_threshold
+        self._llm_failures = 0
+
+    @property
+    def llm_failures(self) -> int:
+        """Number of failed or unusable LLM fallback calls so far."""
+        return self._llm_failures
 
     def classify(self, message: RawMessage) -> ClassificationResult:
         """Classify a single raw message without leaking sensitive values."""
@@ -517,8 +523,10 @@ class MessageClassifier:
                 message_id=message.message_id, safe_message=safe_message
             )
         except Exception:
+            self._llm_failures += 1
             return rule_result
         if llm_result is None:
+            self._llm_failures += 1
             return rule_result
         return llm_result
 

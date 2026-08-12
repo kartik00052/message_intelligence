@@ -7,7 +7,7 @@ environment variables so that nothing is hardcoded to a specific machine.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -16,7 +16,19 @@ DEFAULT_MESSAGES_CSV_PATH = PROJECT_ROOT / "messages.csv"
 DEFAULT_MANDATORY_DEMO_IDS_PATH = PROJECT_ROOT / "mandatory_demo_ids.csv"
 DEFAULT_OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 DEFAULT_EXPECTED_MESSAGE_COUNT = 900
+DEFAULT_EXPECTED_MANDATORY_COUNT = 15
 DEFAULT_LLM_CONFIDENCE_THRESHOLD = 0.75
+DEFAULT_LLM_ENABLED = False
+DEFAULT_LLM_PROVIDER = "openai"
+DEFAULT_LLM_MODEL = ""
+DEFAULT_LLM_API_KEY = ""
+DEFAULT_LLM_BASE_URL = ""
+DEFAULT_LLM_TIMEOUT_SECONDS = 30.0
+
+
+def _secret(value: str) -> str:
+    """Marker type so a secret is clearly not a public value."""
+    return value
 
 
 @dataclass(frozen=True)
@@ -30,6 +42,15 @@ class Settings:
         outputs_dir: Directory where generated JSON artifacts are written.
         expected_message_count: Number of messages the input dataset must
             contain exactly.
+        expected_mandatory_count: Number of mandatory demo IDs that must be
+            provided.
+        llm_enabled: Whether the LLM fallback is available. When False the
+            pipeline runs fully offline using deterministic rules only.
+        llm_provider: Name of the LLM provider (default ``openai``).
+        llm_model: Model identifier sent to the provider.
+        llm_api_key: Secret API key. Never logged or serialized.
+        llm_base_url: Optional provider base URL override.
+        llm_timeout_seconds: Timeout for a single LLM request.
         llm_confidence_threshold: Rule-based confidence below which the LLM
             fallback classifier is consulted (must be in ``[0, 1]``).
     """
@@ -38,7 +59,14 @@ class Settings:
     mandatory_demo_ids_path: Path = DEFAULT_MANDATORY_DEMO_IDS_PATH
     outputs_dir: Path = DEFAULT_OUTPUTS_DIR
     expected_message_count: int = DEFAULT_EXPECTED_MESSAGE_COUNT
+    expected_mandatory_count: int = DEFAULT_EXPECTED_MANDATORY_COUNT
     llm_confidence_threshold: float = DEFAULT_LLM_CONFIDENCE_THRESHOLD
+    llm_enabled: bool = DEFAULT_LLM_ENABLED
+    llm_provider: str = DEFAULT_LLM_PROVIDER
+    llm_model: str = DEFAULT_LLM_MODEL
+    llm_api_key: str = field(default_factory=lambda: _secret(DEFAULT_LLM_API_KEY))
+    llm_base_url: str = DEFAULT_LLM_BASE_URL
+    llm_timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -52,10 +80,42 @@ class Settings:
             expected_message_count=_int_from_env(
                 "EXPECTED_MESSAGE_COUNT", DEFAULT_EXPECTED_MESSAGE_COUNT
             ),
+            expected_mandatory_count=_int_from_env(
+                "EXPECTED_MANDATORY_COUNT", DEFAULT_EXPECTED_MANDATORY_COUNT
+            ),
             llm_confidence_threshold=_float_from_env(
                 "LLM_CONFIDENCE_THRESHOLD", DEFAULT_LLM_CONFIDENCE_THRESHOLD
             ),
+            llm_enabled=_bool_from_env("LLM_ENABLED", DEFAULT_LLM_ENABLED),
+            llm_provider=_str_from_env("LLM_PROVIDER", DEFAULT_LLM_PROVIDER),
+            llm_model=_str_from_env("LLM_MODEL", DEFAULT_LLM_MODEL),
+            llm_api_key=_str_from_env("LLM_API_KEY", DEFAULT_LLM_API_KEY),
+            llm_base_url=_str_from_env("LLM_BASE_URL", DEFAULT_LLM_BASE_URL),
+            llm_timeout_seconds=_float_from_env(
+                "LLM_TIMEOUT_SECONDS", DEFAULT_LLM_TIMEOUT_SECONDS
+            ),
         )
+
+    @property
+    def llm_configured(self) -> bool:
+        """True when the LLM fallback is enabled and a provider is available."""
+        return self.llm_enabled and bool(self.llm_api_key) and bool(self.llm_model)
+
+
+def _bool_from_env(name: str, default: bool) -> bool:
+    """Read an environment variable as a boolean."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _str_from_env(name: str, default: str) -> str:
+    """Read an environment variable as a string."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip()
 
 
 def _path_from_env(name: str, default: Path) -> Path:

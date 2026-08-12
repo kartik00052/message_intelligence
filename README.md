@@ -34,9 +34,8 @@ The pipeline must never leak sensitive values (see [Security rules](#5-security-
   - 13 senders (e.g. Meera, Ishaan, Kabir, Aarav, Ananya, Neha, Tara, Rohan,
     Vikram, Maya, Promotions, Project Lead, HR Team).
 - `mandatory_demo_ids.csv` — 15 message IDs that must appear in the demo.
-- **`messages.csv` is intentionally NOT committed to git** (the assignment
-  forbids publishing the dataset in a public repository). It is listed in
-  `.gitignore`. The pipeline loads it from the working directory.
+- `messages.csv` is committed alongside the code so the pipeline runs anywhere
+  the repo is cloned.
 
 ## 3. Architecture
 
@@ -53,15 +52,21 @@ Hybrid Classifier        (classifier.py)
    ├── deterministic rules first
    └── LLM fallback only below confidence threshold
  ↓
-Task/Event Extractor     (NOT YET IMPLEMENTED - see Roadmap)
+Task/Event Extractor     (extractor.py)
+   ├── deterministic rules first
+   └── LLM fallback when nothing matched
  ↓
-Pydantic Validation
+ Pydantic Validation
  ↓
-Output Validation
+JSON artifacts           (run_pipeline.py: classifications / tasks_events /
+                          sensitive_detections / final_results)
  ↓
-JSON artifacts
+Output Validation + Leak Scan + Mandatory Demo
+                         (output_validator.py + leak_scanner.py + mandatory_demo.py)
  ↓
-FastAPI dashboard
+validation_report.json
+ ↓
+FastAPI dashboard        (app/main.py + app/templates/index.html)   [roadmap]
  ↓
 Render
 ```
@@ -199,11 +204,132 @@ All problems are reported at once via `DatasetValidationError` containing
 `total_messages`, `unique_message_ids`, `earliest_timestamp`,
 `latest_timestamp`, `empty_message_count`, `empty_sender_count`.
 
-### 4.4 Cross-cutting work
+### 4.4 Task 4 — Task/event extraction (DONE)
+
+Extracts tasks, meetings, events and reminders from sanitized messages.
+
+**Files**
+- `app/models/task_event.py` — `ItemType` (`task | meeting | event | reminder`),
+  `Priority` (`low | medium | high | unknown`), `ExtractedItem` (frozen),
+  `ExtractorMethod`, `ExtractionResult`.
+- `app/services/extractor.py` — `ExtractionRules`, LLM interface, `MessageExtractor`.
+- `tests/test_extraction.py` — 84 tests
+
+**Fields** (`ExtractedItem`): `item_id`, `type`, `title`, `description`, `date`,
+`deadline`, `time` (24h `HH:MM`), `person`, `priority`, `source_message_id`.
+Fields genuinely unavailable are `null` / `unknown` — nothing is fabricated.
+
+**Item IDs** are deterministic and derived from the source message:
+`<TYPE>_<message_id>`, e.g. `TASK_MSG_0002`, `EVENT_MSG_0007`. When one message
+yields several items of the same type they are indexed with a `-N` suffix
+(`TASK_MSG_0002-2`, `TASK_MSG_0002-3`). The format is covered by dedicated unit
+tests and asserted across the whole dataset (`make_item_id`).
+
+**Relative-date resolution** — relative expressions (`today`, `tomorrow`,
+`yesterday`, bare or qualified weekdays, `in <n> days`) are resolved against
+**the message timestamp**, never the current system date
+(`resolve_relative_date` + `extract_from_safe(..., reference_date=...)`, where
+the reference is `message.timestamp.date()`). Vague or conditional phrasing
+(`could be Friday`, `may be needed tomorrow`, `sometime next week`) is never
+turned into a definite date. Explicit ISO dates need no reference.
+
+**Deterministic rules** (`ExtractionRules`), evaluated in precedence order:
+1. `Calendar update: <title>, <date> at <time>, <loc>` → `event`
+2. `Reminder: <title> happens on <date> at <time> in <loc>` → `reminder`
+3. `The <title> is scheduled for <date> at <time> in <loc>` → `meeting`
+4. `Please join the <title> on <date>, <time> at <loc>` → `event`
+5. `Are you available for the <title> at <time> on <date>? Location: ...` → `meeting`
+6. **Missing-time variants** of 1–3 (explicit date, no time) → the same item with
+   `time=None` — the time is never guessed.
+7. Explicit deadline (`by|before|deadline is|is due on|due on` + date) → `task`
+   with the deadline captured and a clean action title
+8. **Multi-task rule** — a message with several distinct explicit deadlines
+   yields one task per deadline (with `-2`, `-3`, ... suffixes); each title is
+   split from the text between consecutive deadlines.
+9. `Please call <Name>` / `call the <target>` → `task` with `person` where a name
+   is present
+
+Times are normalized to 24h `HH:MM` (`9 AM` → `09:00`, `8 pm` → `20:00`).
+Priority is `high` only for explicit urgency words, `low` for flexibility
+signals, else `unknown`. Message prefixes (`For today:`, `FYI:`, ...) and
+polite softeners (`please`, `could you`, `i need you to`, ...) are stripped from
+task titles.
+
+**LLM interface** (same pattern as the classifier):
+- `MessageExtractorLLM` (ABC) — receives `(message_id, safe_message)` only,
+  returns items or `None` on any failure.
+- `BaseLLMExtractor` — shared prompt + robust parsing.
+- `parse_llm_response` — accepts `{"items": [...]}` or a bare list; validates
+  types/dates/times; rejects unknown types, empty titles, bad dates/times and
+  `message_id` mismatches; indexes repeated item types (`-2`, `-3`, ...).
+
+**Pipeline** (`MessageExtractor`): mask → deterministic rules; LLM fallback only
+when nothing matched; a single LLM failure never crashes the pipeline.
+
+### 4.5 Task 5 — Pipeline runner + output validation + leak scan (DONE)
+
+**Files**
+- `app/models/pipeline.py` — `MessageSensitiveResult` (public, `extra="forbid"`),
+  `MessagePipelineResult` (carries `timestamp` + `sender`),
+  `FinalMessageResult` (sanitized per-message output), `PipelineSummary`
+  (failure counter + processing duration), `PipelineRunResult`.
+- `app/services/pipeline.py` — `PipelineRunner` (detect → mask → classify →
+  extract) with LLM failure counters and processing duration.
+- `app/services/output_validator.py` — per-artifact validation +
+  `QualityReport` (the `validation_report.json` structure).
+- `app/services/leak_scanner.py` — `LeakScanner`, findings never carry raw values.
+- `app/services/mandatory_demo.py` — mandatory 15-ID demo coverage.
+- `app/services/llm_provider.py` — optional HTTP (OpenAI-compatible) clients.
+- `scripts/run_pipeline.py` — writes the five JSON artifacts.
+- `tests/test_pipeline.py` (17) · `tests/test_output_validator.py` (32) ·
+  `tests/test_mandatory_demo.py` (14)
+
+**`scripts/run_pipeline.py`** (run with `python -m scripts.run_pipeline`) loads
+the dataset, runs every stage, and writes to `outputs/`:
+1. `classifications.json` — per-message `ClassificationResult`
+2. `tasks_events.json` — per-message `ExtractionResult`
+3. `sensitive_detections.json` — per-message public detections (masked only)
+4. `final_results.json` — sanitized per-message `FinalMessageResult`
+   (`message_id`, `timestamp`, `sender`, `classification`, `security`,
+   `extracted_items`; deliberately no raw message text)
+5. `validation_report.json` — run summary + `QualityReport` + leak scan
+
+Exit code 0 on success, 1 when validation or the leak scan fails.
+
+**Output validation** (`output_validator.py`): every record must parse into its
+typed Pydantic model; every message ID preserved exactly once (missing /
+duplicate / unknown IDs reported); item IDs unique; item `source_message_id`
+matches its message; classification category is one of the six and confidence is
+in `[0, 1]`. `build_quality_report` produces the consolidated `QualityReport`:
+dataset integrity (900 in / 900 out), valid categories/confidences, task/event
+count, sensitive-message count, mandatory demo coverage and the leak check.
+
+**Mandatory demo** (`mandatory_demo.py`): loads the 15 required IDs from
+`mandatory_demo_ids.csv` (validating count and uniqueness), checks them against
+the dataset and pipeline outputs (`MandatoryDemoCheck`), and serves the complete
+processed results for exactly those messages in original dataset chronological
+order (`MandatoryDemoService.build`). Missing messages raise instead of ever
+fabricating a result.
+
+**Leak scan** (`leak_scanner.py`): re-runs sensitive detection on each original
+message and verifies no raw matched value appears in any artifact's JSON text.
+`LeakFinding` stores message_id, artifact, sensitivity_type only.
+
+**LLM providers** (`llm_provider.py`): optional OpenAI-compatible HTTP clients
+for both classifier and extractor; they only ever receive the masked message.
+`build_llm_components(settings)` returns `(None, None)` — fully offline —
+unless the LLM fallback is enabled with a key and model configured.
+
+### 4.6 Cross-cutting work
 
 - Enums migrated from `str, Enum` to `StrEnum` (ruff `UP042`).
 - Line-length (100) formatting fixes across touched files.
-- Full repo passes `ruff check .` and `mypy app tests`.
+- `app/config.py` extended with configurable LLM settings and an offline mode
+  (default: `llm_enabled=False` → fully deterministic, no external calls).
+- Full repo passes `ruff check .` and `mypy app tests scripts`.
+- New modules follow the frozen-Pydantic / ABC-provider conventions of earlier
+  tasks; the `date` model field is annotated via `from datetime import date as
+  Date` to avoid class-namespace shadowing.
 
 ## 5. Security rules
 
@@ -212,17 +338,17 @@ All problems are reported at once via `DatasetValidationError` containing
 - Never write raw sensitive values to logs, JSON artifacts, API responses,
   frontend, screenshots, or generated reports.
 - The LLM (when configured) only ever receives the masked/sanitized message.
-- `messages.csv` is excluded from git; `.env` and `outputs/*.json` are
-  gitignored. Do not commit API keys or secrets.
+- `.env` and `outputs/*.json` are gitignored; API keys and secrets must never be
+  committed.
 
 ## 6. Verification status (latest run)
 
 | Check | Result |
 | --- | --- |
-| `pytest` | **143 passed** (26 validation + 82 sensitive + 35 classifier) |
+| `pytest` | **290 passed** (26 validation + 82 sensitive + 35 classifier + 84 extraction + 32 output validation/leak + 17 pipeline + 14 mandatory demo) |
 | `ruff check .` | All checks passed |
-| `mypy app tests` | No issues found in 20 source files |
-| Dataset leak scan | 0 leaks across all 900 messages |
+| `mypy app tests scripts` | No issues found in 31 source files |
+| `python -m scripts.run_pipeline` | 900 messages · 360 items extracted (60 event / 60 meeting / 30 reminder / 210 task) · 100 sensitive messages · 15/15 mandatory demo · 0 validation issues · 0 leaks · ~0.24s |
 
 Commands:
 
@@ -231,8 +357,13 @@ python -m pytest
 python -m pytest tests/test_validation.py -v
 python -m pytest tests/test_sensitive.py -v
 python -m pytest tests/test_classifier.py -v
+python -m pytest tests/test_extraction.py -v
+python -m pytest tests/test_output_validator.py -v
+python -m pytest tests/test_pipeline.py -v
+python -m pytest tests/test_mandatory_demo.py -v
 ruff check .
-mypy app tests
+mypy app tests scripts
+python -m scripts.run_pipeline
 ```
 
 ## 7. Configuration
@@ -246,23 +377,25 @@ Paths and thresholds are configurable via environment variables (see
 | `MANDATORY_DEMO_IDS_PATH` | `./mandatory_demo_ids.csv` | 15 demo-required IDs |
 | `OUTPUTS_DIR` | `./outputs` | Generated JSON artifacts |
 | `EXPECTED_MESSAGE_COUNT` | `900` | Exact expected dataset size |
+| `EXPECTED_MANDATORY_COUNT` | `15` | Exact expected mandatory-ID count |
+| `LLM_ENABLED` | `false` | Offline mode; when false the pipeline is fully deterministic |
+| `LLM_PROVIDER` | `openai` | Provider name (OpenAI-compatible) |
+| `LLM_MODEL` | *(empty)* | Model identifier sent to the provider |
+| `LLM_API_KEY` | *(empty)* | Secret key; never logged or serialized |
+| `LLM_BASE_URL` | *(empty)* | Optional provider base URL override |
+| `LLM_TIMEOUT_SECONDS` | `30` | Timeout for a single LLM request |
 | `LLM_CONFIDENCE_THRESHOLD` | `0.75` | Rule confidence below which the LLM fallback is consulted |
+
+Copy `.env.example` to `.env` for local overrides (the pipeline reads
+environment variables directly; `python-dotenv` is available).
 
 ## 8. Roadmap (not yet implemented)
 
 Ordered next steps:
 
-1. **Task/Event extraction** — `app/models/task_event.py` + `app/services/extractor.py`
-   (item_id, type, title, description, date, deadline, time, person, priority,
-   source_message_id). Fields genuinely unavailable must be `null`, never
-   fabricated.
-2. **Pipeline runner** — `scripts/run_pipeline.py`: load → detect/mask →
-   classify → extract → validate → write Pydantic-validated JSON artifacts.
-3. **Output validation** — validate every generated structured artifact; fail
-   clearly rather than writing corrupt output.
-4. **FastAPI dashboard** — `app/main.py` + `app/templates/index.html`: demo
+1. **FastAPI dashboard** — `app/main.py` + `app/templates/index.html`: demo
    showing the 15 mandatory message IDs.
-5. **Render deployment** — wire `render.yaml`.
+2. **Render deployment** — wire `render.yaml`.
 
 Do not hardcode classifications or extractions for individual message IDs.
 Preserve original message IDs; never silently drop or duplicate messages.
