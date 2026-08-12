@@ -15,6 +15,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MESSAGES_CSV_PATH = PROJECT_ROOT / "messages.csv"
 DEFAULT_MANDATORY_DEMO_IDS_PATH = PROJECT_ROOT / "mandatory_demo_ids.csv"
 DEFAULT_OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+DEFAULT_ENCRYPTED_DATA_DIR = PROJECT_ROOT / "data"
+DEFAULT_DATASET_KEY_FILE = DEFAULT_ENCRYPTED_DATA_DIR / ".dataset.key"
 DEFAULT_EXPECTED_MESSAGE_COUNT = 900
 DEFAULT_EXPECTED_MANDATORY_COUNT = 15
 DEFAULT_LLM_CONFIDENCE_THRESHOLD = 0.75
@@ -58,6 +60,8 @@ class Settings:
     messages_csv_path: Path = DEFAULT_MESSAGES_CSV_PATH
     mandatory_demo_ids_path: Path = DEFAULT_MANDATORY_DEMO_IDS_PATH
     outputs_dir: Path = DEFAULT_OUTPUTS_DIR
+    encrypted_data_dir: Path = DEFAULT_ENCRYPTED_DATA_DIR
+    dataset_key_file: Path = DEFAULT_DATASET_KEY_FILE
     expected_message_count: int = DEFAULT_EXPECTED_MESSAGE_COUNT
     expected_mandatory_count: int = DEFAULT_EXPECTED_MANDATORY_COUNT
     llm_confidence_threshold: float = DEFAULT_LLM_CONFIDENCE_THRESHOLD
@@ -77,6 +81,10 @@ class Settings:
                 "MANDATORY_DEMO_IDS_PATH", DEFAULT_MANDATORY_DEMO_IDS_PATH
             ),
             outputs_dir=_path_from_env("OUTPUTS_DIR", DEFAULT_OUTPUTS_DIR),
+            encrypted_data_dir=_path_from_env(
+                "ENCRYPTED_DATA_DIR", DEFAULT_ENCRYPTED_DATA_DIR
+            ),
+            dataset_key_file=_path_from_env("DATASET_KEY_FILE", DEFAULT_DATASET_KEY_FILE),
             expected_message_count=_int_from_env(
                 "EXPECTED_MESSAGE_COUNT", DEFAULT_EXPECTED_MESSAGE_COUNT
             ),

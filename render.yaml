@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: message-intelligence
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.run_pipeline && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      # Secret Fernet key that decrypts the committed data/*.enc dataset blobs
+      # at start time (see scripts.encrypt_dataset). sync: false -> enter it in
+      # the Render dashboard; never commit the key.
+      - key: DATASET_ENC_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.14.3

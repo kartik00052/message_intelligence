@@ -34,12 +34,20 @@ The pipeline must never leak sensitive values (see [Security rules](#5-security-
   - 13 senders (e.g. Meera, Ishaan, Kabir, Aarav, Ananya, Neha, Tara, Rohan,
     Vikram, Maya, Promotions, Project Lead, HR Team).
 - `mandatory_demo_ids.csv` — 15 message IDs that must appear in the demo.
-- `messages.csv` is committed alongside the code so the pipeline runs anywhere
-  the repo is cloned.
+- **Privacy rule:** the assignment forbids publishing the dataset in a public
+  repository, so the plaintext CSVs are **not** committed. The repository
+  instead commits Fernet-encrypted blobs (`data/messages.csv.enc`,
+  `data/mandatory_demo_ids.csv.enc`) plus a decryption routine. The pipeline
+  materializes the plaintext CSVs on demand from the committed blobs using a
+  key supplied via the `DATASET_ENC_KEY` environment variable (production) or
+  the gitignored `data/.dataset.key` file (local development) — see
+  §4.7 and §7. `scripts/encrypt_dataset.py` produces the blobs.
 
 ## 3. Architecture
 
 ```
+Encrypted dataset blobs  (data/*.enc, committed; key from DATASET_ENC_KEY)
+ ↓  prepare_datasets() / python -m scripts.encrypt_dataset (encrypts the other way)
 CSV
  ↓
 Input Validator          (loader.py + validator.py)
@@ -66,7 +74,7 @@ Output Validation + Leak Scan + Mandatory Demo
  ↓
 validation_report.json
  ↓
-FastAPI dashboard        (app/main.py + app/templates/index.html)   [roadmap]
+FastAPI dashboard        (app/main.py + app/templates/dashboard.html)
  ↓
 Render
 ```
@@ -331,6 +339,45 @@ unless the LLM fallback is enabled with a key and model configured.
   tasks; the `date` model field is annotated via `from datetime import date as
   Date` to avoid class-namespace shadowing.
 
+### 4.7 Dataset encryption (privacy) (DONE)
+
+**Files**
+- `app/services/dataset_cipher.py` — Fernet helpers + `prepare_datasets`
+- `scripts/encrypt_dataset.py` — encrypts plaintext CSVs into `data/*.enc`
+- `tests/test_dataset_cipher.py` — 8 tests
+
+The assignment forbids publishing the dataset in a public repository, so the
+plaintext CSVs are never tracked. Instead:
+- `scripts/encrypt_dataset.py` encrypts `messages.csv` and
+  `mandatory_demo_ids.csv` into `data/messages.csv.enc` and
+  `data/mandatory_demo_ids.csv.enc` and verifies a byte-identical round trip.
+- The key comes from the `DATASET_ENC_KEY` environment variable or the
+  gitignored `data/.dataset.key` file (`--new-key` forces a fresh key).
+- `prepare_datasets(settings)` (called at the start of
+  `python -m scripts.run_pipeline`) decrypts a plaintext CSV back into place
+  exactly when it is missing, so a fresh clone can regenerate the dataset
+  before the pipeline runs.
+- On Render the key is a dashboard secret (`DATASET_ENC_KEY` in `render.yaml`),
+  never committed.
+
+### 4.8 Task 6 — FastAPI dashboard (DONE)
+
+**Files**
+- `app/main.py` — FastAPI app: dashboard + sanitized read API
+- `app/models/api.py` — response models
+- `app/services/api_service.py` — filtering/pagination/stats/mandatory demo
+- `app/services/output_repository.py` — typed reads of the `outputs/` artifacts
+- `app/templates/dashboard.html`, `app/templates/base.html` — dashboard UI
+- `app/static/app.js`, `app/static/styles.css` — client assets
+- `tests/test_api.py` — 24 tests
+
+The app is a thin presentation layer over the validated pipeline artifacts:
+`GET /` (dashboard), `GET /health`, `/api/stats`, `/api/messages`,
+`/api/messages/{id}`, `/api/tasks`, `/api/sensitive`, `/api/demo/mandatory`,
+`/api/validation`. Responses only ever serialize the pipeline's sanitized
+models; the raw message text and sensitive values never reach the API.
+`app = create_app()` at module import; run with `uvicorn app.main:app`.
+
 ## 5. Security rules
 
 - Raw sensitive values exist **only** in `SensitiveDetection` private
@@ -338,6 +385,9 @@ unless the LLM fallback is enabled with a key and model configured.
 - Never write raw sensitive values to logs, JSON artifacts, API responses,
   frontend, screenshots, or generated reports.
 - The LLM (when configured) only ever receives the masked/sanitized message.
+- The plaintext dataset CSVs and the Fernet key (`DATASET_ENC_KEY`,
+  `data/.dataset.key`) are never committed or logged; only the encrypted
+  `data/*.enc` blobs live in the repository.
 - `.env` and `outputs/*.json` are gitignored; API keys and secrets must never be
   committed.
 
@@ -345,10 +395,10 @@ unless the LLM fallback is enabled with a key and model configured.
 
 | Check | Result |
 | --- | --- |
-| `pytest` | **290 passed** (26 validation + 82 sensitive + 35 classifier + 84 extraction + 32 output validation/leak + 17 pipeline + 14 mandatory demo) |
+| `pytest` | **322 passed** (26 validation + 82 sensitive + 35 classifier + 84 extraction + 32 output validation/leak + 17 pipeline + 14 mandatory demo + 8 dataset cipher + 24 API) |
 | `ruff check .` | All checks passed |
-| `mypy app tests scripts` | No issues found in 31 source files |
-| `python -m scripts.run_pipeline` | 900 messages · 360 items extracted (60 event / 60 meeting / 30 reminder / 210 task) · 100 sensitive messages · 15/15 mandatory demo · 0 validation issues · 0 leaks · ~0.24s |
+| `mypy app tests scripts` | No issues found in 38 source files |
+| `python -m scripts.run_pipeline` | 900 messages · 360 items extracted (60 event / 60 meeting / 30 reminder / 210 task) · 100 sensitive messages · 15/15 mandatory demo · 0 validation issues · 0 leaks · ~0.2s · validation PASS |
 
 Commands:
 
@@ -361,9 +411,13 @@ python -m pytest tests/test_extraction.py -v
 python -m pytest tests/test_output_validator.py -v
 python -m pytest tests/test_pipeline.py -v
 python -m pytest tests/test_mandatory_demo.py -v
+python -m pytest tests/test_dataset_cipher.py -v
+python -m pytest tests/test_api.py -v
 ruff check .
 mypy app tests scripts
-python -m scripts.run_pipeline
+python -m scripts.encrypt_dataset        # (re)create data/*.enc from plaintext CSVs
+python -m scripts.run_pipeline           # decrypt-on-demand, then process
+uvicorn app.main:app                     # local dashboard
 ```
 
 ## 7. Configuration
@@ -373,9 +427,12 @@ Paths and thresholds are configurable via environment variables (see
 
 | Env var | Default | Purpose |
 | --- | --- | --- |
-| `MESSAGES_CSV_PATH` | `./messages.csv` | Input dataset |
+| `MESSAGES_CSV_PATH` | `./messages.csv` | Input dataset (decrypted on demand) |
 | `MANDATORY_DEMO_IDS_PATH` | `./mandatory_demo_ids.csv` | 15 demo-required IDs |
 | `OUTPUTS_DIR` | `./outputs` | Generated JSON artifacts |
+| `ENCRYPTED_DATA_DIR` | `./data` | Committed `*.enc` Fernet blobs |
+| `DATASET_KEY_FILE` | `./data/.dataset.key` | Local gitignored Fernet key file |
+| `DATASET_ENC_KEY` | *(empty)* | Fernet key secret; Render dashboard env var |
 | `EXPECTED_MESSAGE_COUNT` | `900` | Exact expected dataset size |
 | `EXPECTED_MANDATORY_COUNT` | `15` | Exact expected mandatory-ID count |
 | `LLM_ENABLED` | `false` | Offline mode; when false the pipeline is fully deterministic |
@@ -389,13 +446,20 @@ Paths and thresholds are configurable via environment variables (see
 Copy `.env.example` to `.env` for local overrides (the pipeline reads
 environment variables directly; `python-dotenv` is available).
 
-## 8. Roadmap (not yet implemented)
+## 8. Deployment (Render) — ready to ship
 
-Ordered next steps:
+The dashboard and API are implemented and the `render.yaml` Blueprint is wired.
 
-1. **FastAPI dashboard** — `app/main.py` + `app/templates/index.html`: demo
-   showing the 15 mandatory message IDs.
-2. **Render deployment** — wire `render.yaml`.
+1. The GitHub repository must stay **private** (the assignment forbids
+   publishing the dataset; only encrypted blobs are committed).
+2. Generate the dataset key once: `python -m scripts.encrypt_dataset`. Copy the
+   printed Fernet key into the Render dashboard as the `DATASET_ENC_KEY` secret
+   (keep `sync: false` in `render.yaml`; never commit it).
+3. Push `main`. Render Blueprint builds with `pip install -r requirements.txt`
+   (Python `3.14.3`, from `.python-version`) and starts with
+   `python -m scripts.run_pipeline && uvicorn app.main:app --host 0.0.0.0 --port $PORT`,
+   which decrypts the dataset, regenerates the artifacts, and serves the
+   dashboard. No external services or LLM calls are required.
 
 Do not hardcode classifications or extractions for individual message IDs.
 Preserve original message IDs; never silently drop or duplicate messages.

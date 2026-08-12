@@ -18,6 +18,7 @@ from pathlib import Path
 
 from app.config import Settings
 from app.models.pipeline import MessagePipelineResult, PipelineRunResult
+from app.services.dataset_cipher import prepare_datasets
 from app.services.leak_scanner import LeakScanner, LeakScanResult
 from app.services.loader import load_messages_csv
 from app.services.mandatory_demo import MandatoryDemoService, load_mandatory_ids
@@ -226,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     """Entry point used by ``python -m scripts.run_pipeline``."""
     del argv  # no custom CLI flags yet; everything comes from settings/env
     settings = Settings.from_env()
+    prepare_datasets(settings)
     run_result, report, leak_scan = run(settings=settings)
 
     summary = run_result.summary

@@ -6,3 +6,8 @@ __pycache__/
 .ruff_cache/
 .env
 outputs/*.json
+
+# Plaintext dataset is never committed; only the encrypted data/*.enc blobs are.
+messages.csv
+mandatory_demo_ids.csv
+data/.dataset.key
