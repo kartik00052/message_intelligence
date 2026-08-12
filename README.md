@@ -1,441 +1,421 @@
-# Message Intelligence Pipeline
+# Message Intelligence
 
-Hybrid message-intelligence pipeline: ingests a 900-message CSV, detects and
-masks sensitive information, classifies every message into one of six
-categories (deterministic rules first, optional LLM fallback), and later
-extracts tasks/events. Output is served through a FastAPI dashboard.
+A hybrid message-intelligence pipeline for the L1 candidate assignment. It
+ingests a 900-message CSV, detects and masks sensitive information, classifies
+every message into exactly one of six categories, extracts actionable tasks and
+scheduled events, validates every artifact, and serves the results through a
+FastAPI dashboard.
 
-> **Checkpoint document.** This README records every implemented subsystem and
-> the current verification status so that work can resume at any time. Read the
-> "Implemented subsystems" and "Roadmap" sections before continuing.
+The pipeline is fully deterministic and offline by default. An optional LLM
+fallback can be enabled for low-confidence classifications and unmatched
+extractions; it is disabled unless explicitly configured and only ever receives
+masked message text.
+
+> **Privacy requirement (from `README.txt`):** the dataset must not be
+> published in a public repository and raw messages must never be sent to
+> external AI services. This repository therefore commits only
+> Fernet-encrypted dataset blobs and never sends raw text anywhere (see
+> [§6 Sensitive Information Detection](#6-sensitive-information-detection) and
+> [§22 Privacy/Security Notes](#22-privacysecurity-notes)).
 
 ---
 
-## 1. Project overview
+## 1. Overview
 
-| Area | Choice |
-| --- | --- |
-| Language | Python >= 3.14 (repo `pyproject.toml`; assignment requires 3.12+) |
-| API | FastAPI |
-| Validation | Pydantic v2 |
-| Data | pandas |
-| Tests | pytest |
-| Lint / types | ruff, mypy |
-| External services | None required; LLM is an optional, swappable fallback |
+The assignment: build a system that processes a folder of fictional messages
+and turns them into structured, safe-to-share intelligence.
 
-The pipeline must never leak sensitive values (see [Security rules](#5-security-rules)).
+This system implements that end-to-end:
 
-## 2. Dataset
+1. **Ingest** a 900-message CSV (fictional but deliberately sensitive-looking
+   values), validating schema, size, IDs, timestamps and ordering.
+2. **Detect and mask** sensitive values *before* anything else touches the
+   message, so no raw credential ever reaches a downstream stage.
+3. **Classify** every message into one of six categories with a confidence
+   score, a short reason and the method used.
+4. **Extract** tasks, meetings, events and reminders with dates, deadlines,
+   times and priority - without guessing a single field.
+5. **Validate** every output artifact and scan it for sensitive-value leaks.
+6. **Serve** the sanitized results through a FastAPI dashboard (including the
+   15 messages required for the demo video) and document a Render deployment.
 
-- `messages.csv` — 900 fictional messages, chronological, UTF-8 (BOM). Columns:
-  `message_id`, `timestamp` (`%Y-%m-%d %H:%M:%S`), `sender`, `message`.
-  - 900 rows, all IDs unique, no null/empty cells, strictly chronological.
-  - Earliest: `2026-09-01 08:00:00` · Latest: `2026-09-24 10:23:00`.
-  - 13 senders (e.g. Meera, Ishaan, Kabir, Aarav, Ananya, Neha, Tara, Rohan,
-    Vikram, Maya, Promotions, Project Lead, HR Team).
-- `mandatory_demo_ids.csv` — 15 message IDs that must appear in the demo.
-- **Privacy rule:** the assignment forbids publishing the dataset in a public
-  repository, so the plaintext CSVs are **not** committed. The repository
-  instead commits Fernet-encrypted blobs (`data/messages.csv.enc`,
-  `data/mandatory_demo_ids.csv.enc`) plus a decryption routine. The pipeline
-  materializes the plaintext CSVs on demand from the committed blobs using a
-  key supplied via the `DATASET_ENC_KEY` environment variable (production) or
-  the gitignored `data/.dataset.key` file (local development) — see
-  §4.7 and §7. `scripts/encrypt_dataset.py` produces the blobs.
+No answer labels are used; every category and extraction is derived from the
+message content itself.
+
+## 2. Features
+
+- **Message classification** - every message is classified into exactly one of
+  six categories with a confidence score, a reason and the method used.
+- **Task/event extraction** - tasks, meetings, events and reminders with
+  date/deadline/time/person/priority fields; several explicit deadlines in one
+  message yield one task each.
+- **Sensitive information detection** - 14 sensitive types (OTPs, passwords,
+  PINs, tokens, recovery codes, cards, bank accounts, UPI IDs, phone numbers,
+  emails, addresses, ID numbers, health data and other credentials).
+- **Masking** - detected values are replaced in-place (star or bracket masks)
+  so the safe message keeps its surrounding context.
+- **Hybrid rules + LLM fallback** - deterministic rules run first; an optional
+  LLM is consulted only for low-confidence classifications or unmatched
+  extractions, and only ever sees masked text. Fully offline by default.
+- **Structured outputs** - every result is a Pydantic-validated model and is
+  written to machine-readable JSON artifacts.
+- **Validation** - input validation, output validation (IDs preserved exactly
+  once, schemas enforced) and a sensitive-value leak scan.
+- **FastAPI dashboard** - a single-page dashboard over the sanitized artifacts
+  plus a typed read-only API.
+- **Mandatory message demo** - the 15 required message IDs are loaded from a
+  CSV (never hardcoded) and shown in dataset order.
 
 ## 3. Architecture
 
+The pipeline runs every message through these stages in order:
+
 ```
-Encrypted dataset blobs  (data/*.enc, committed; key from DATASET_ENC_KEY)
- ↓  prepare_datasets() / python -m scripts.encrypt_dataset (encrypts the other way)
 CSV
- ↓
-Input Validator          (loader.py + validator.py)
- ↓
-Sensitive Data Detector  (sensitive_detector.py)
- ↓
-Mask Sensitive Data      (masker.py)
- ↓
-Hybrid Classifier        (classifier.py)
-   ├── deterministic rules first
-   └── LLM fallback only below confidence threshold
- ↓
-Task/Event Extractor     (extractor.py)
-   ├── deterministic rules first
-   └── LLM fallback when nothing matched
- ↓
- Pydantic Validation
- ↓
-JSON artifacts           (run_pipeline.py: classifications / tasks_events /
-                          sensitive_detections / final_results)
- ↓
-Output Validation + Leak Scan + Mandatory Demo
-                         (output_validator.py + leak_scanner.py + mandatory_demo.py)
- ↓
-validation_report.json
- ↓
-FastAPI dashboard        (app/main.py + app/templates/dashboard.html)
- ↓
-Render
+→ Input Validation
+→ Sensitive Detection
+→ Masking
+→ Hybrid Classification
+→ Task/Event Extraction
+→ Pydantic Validation
+→ Output Validation
+→ JSON Artifacts
+→ FastAPI Dashboard
+→ Render
 ```
 
-## 4. Implemented subsystems (task log)
+- `app/services/loader.py` + `app/services/validator.py` read and validate the
+  input CSV into typed `RawMessage` objects.
+- `app/services/sensitive_detector.py` runs before classification/extraction
+  and `app/services/masker.py` replaces every detected span in-place.
+- `app/services/classifier.py` and `app/services/extractor.py` only ever see
+  the masked message. Both implement deterministic rules first with an
+  optional LLM fallback.
+- `app/services/pipeline.py` orchestrates detection → masking → classification
+  → extraction and produces validated `MessagePipelineResult` models.
+- `app/services/output_validator.py` and `app/services/leak_scanner.py`
+  validate the artifacts and check for sensitive-value leaks.
+- `scripts/run_pipeline.py` writes the JSON artifacts to `outputs/`.
+- `app/main.py` serves the FastAPI dashboard and read API over the artifacts.
+- `render.yaml` deploys the app to Render.
 
-### 4.1 Task 1 — Sensitive information detection and masking (DONE)
+The LLM is optional and swappable (`app/services/llm_provider.py`); the
+default configuration returns `(None, None)` so the pipeline is fully offline
+and deterministic.
 
-Detects sensitive values **before** any message can reach an external LLM.
+## 4. Classification
 
-**Files**
-- `app/models/sensitive.py` — internal vs public representation
-- `app/services/sensitive_detector.py` — the detector
-- `app/services/masker.py` — the masker
-- `tests/test_sensitive.py` — 82 tests
+Each message is assigned **exactly one** of six categories:
 
-**Models (`app/models/sensitive.py`)**
-- `SensitiveType` (14 values): `one_time_password`, `password`, `pin`,
-  `authentication_token`, `account_recovery_code`, `payment_card_number`,
-  `bank_account_number`, `upi_payment_identifier`, `private_phone_number`,
-  `private_email`, `private_address`, `identification_number`,
-  `health_information`, `other_sensitive_credential`.
-- `RiskLevel`: `low | medium | high`.
-- `SensitiveDetection` — **internal** result. The raw matched value is stored in
-  a Pydantic `PrivateAttr` (with `start`/`end` span) and is therefore excluded
-  from `model_dump()` / `model_dump_json()`.
-- `PublicSensitiveDetection` — sanitized result (`detected`, `sensitivity_type`,
-  `risk`, `masked_text`, `recommended_action`) with no raw value.
-- `SensitiveAnalysis` — per-message analysis: `message_id`, `detections`,
-  `safe_message`, `has_detection`.
+| Category | Meaning |
+| --- | --- |
+| `action_required` | A request to do something (task verb, direct ask or deadline). |
+| `meeting_or_event` | A meeting or event with schedule, date, time or location signals. |
+| `personal_information` | A personal fact, preference or profile detail. |
+| `general_information` | An informational statement with no action, event or offer. |
+| `promotional` | Promotional content: an offer, sale or promo code. |
+| `sensitive_information` | A message containing detected sensitive content. |
 
-**Detection strategy (`app/services/sensitive_detector.py`)**
-Combination of carefully designed regexes + contextual keyword signals +
-validation heuristics (length checks, Luhn checksum for cards, plain-word
-rejection, digit-count checks for phone numbers, single-label-domain rejection
-for UPI). Detection is deliberately conservative to avoid false positives.
+`ClassificationResult` carries `message_id`, `category`, `confidence` (a float
+in `[0, 1]`), `reason` (a short justification, capped at 300 characters) and
+`method` (`rule_based` or `llm_fallback`).
 
-Masking preserves surrounding context:
-- Star-masked same length: OTP / password / PIN / recovery code / card / bank /
-  UPI (e.g. `Your OTP is 482913` → `Your OTP is ******`).
-- Bracket-masked: `[REDACTED_TOKEN]`, `[REDACTED_PHONE]`, `[REDACTED_EMAIL]`,
+**Approach.** The `RuleClassifier` scores four candidate categories with
+context-aware signals:
+
+- **Action**: action phrases (`please submit`, `review the`, `don't forget`,
+  ...), weak asks (`can you`, `could you`, ...) and deadline signals
+  (`by <date>`, `deadline`, `due on`, `asap`, ...).
+- **Meeting/event**: strong nouns (`calendar`, `meeting`, `dinner`, `demo`,
+  `session`, ...), weak nouns (`meet`, `review`, ...) and context regexes
+  (ISO dates, `at <time>`, `tomorrow`, `next week`, locations such as `meeting
+  room` or `the library`, ...).
+- **Promotional**: offer phrases (`discount`, `sale`, `cashback`, `% off`,
+  `use code`, ...) and promo-code patterns (`code SAVE30`, ...).
+- **Personal**: preference phrases (`my favourite`, `i prefer`, `i like`, `my
+  birthday`, ...).
+
+The category with the highest score wins. Scores below the rule confidence
+floor (`0.65`) are classified as `general_information` with a fixed confidence
+of `0.5`. When sensitive detections exist the message is classified
+`sensitive_information` (confidence `0.97` for high-risk types, else `0.92`).
+
+The `MessageClassifier` masks the message first, applies the rules, and only
+calls the LLM when the rule confidence is below `llm_confidence_threshold`
+(default `0.75`).
+
+## 5. Task/Event Extraction
+
+`ExtractedItem` is the validated representation of one actionable or scheduled
+item. Fields that are genuinely unavailable are `null`/`unknown` - nothing is
+fabricated.
+
+**Schema**
+
+| Field | Meaning |
+| --- | --- |
+| `item_id` | Deterministic ID: `<TYPE>_<message_id>` (e.g. `TASK_MSG_0002`); repeated types get `-2`, `-3` suffixes. |
+| `type` | `task`, `meeting`, `event` or `reminder`. |
+| `title` | Short, cleaned title derived only from the message. |
+| `description` | Optional context (location etc.), else `null`. |
+| `date` | Calendar date (`YYYY-MM-DD`) when explicitly stated. |
+| `deadline` | Due date for tasks when explicitly stated. |
+| `time` | Normalized 24h `HH:MM` when explicitly stated. |
+| `person` | A clearly named person, else `null`. |
+| `priority` | `low`, `medium`, `high` or `unknown`. |
+| `source_message_id` | The message the item was extracted from. |
+
+**Date handling.** Explicit ISO dates (`2026-09-04`) are parsed directly.
+Relative expressions are resolved against **the message timestamp**, never the
+current system date.
+
+**Relative dates.** `today`, `tomorrow`, `yesterday`, bare or qualified
+weekdays (`friday`, `this friday`, `next friday`) and `in <n> days` (digit or
+word based) are supported.
+
+**Null/unresolved behavior.** Vague or conditional phrasing (`could be Friday`,
+`may be needed tomorrow`, `sometime next week`) is never turned into a definite
+date - it resolves to `null`. A missing reference date also yields `null`.
+
+**Priority rules.** `high` for explicit urgency words (`urgent`, `asap`,
+`critical`, `immediately`, `as soon as possible`); `low` for flexibility
+signals (`no rush`, `whenever`, `when you are free`, `at your convenience`);
+otherwise `unknown`.
+
+**No guessing policy.** A field is populated only when it is explicitly stated
+in the message. Message prefixes (`For today:`, `FYI:`, ...) and polite
+softeners (`please`, `could you`, `i need you to`, ...) are stripped from
+titles rather than interpreted as dates or constraints.
+
+The deterministic `ExtractionRules` run in a fixed precedence order (calendar
+updates, reminders, scheduled meetings, join requests, availability requests,
+missing-time variants, explicit deadlines, call requests). A message with
+several distinct explicit deadlines produces one task per deadline. When no
+rule matches, the optional LLM fallback is consulted; if nothing matches, the
+result is an empty item list with method `none`.
+
+## 6. Sensitive Information Detection
+
+Detection runs before any other stage so a masked value never reaches
+classification, extraction, the LLM, the API or the UI.
+
+**Detection strategy.** A combination of:
+
+- **Regex/rule detection** - per-type regular expressions for OTPs, passwords,
+  PINs, tokens (including `sk-`/`pk-`/`ghp_` prefixes and JWTs), recovery
+  codes, card numbers, bank accounts, UPI IDs, phone numbers, emails,
+  addresses, ID numbers (PAN, Aadhaar, passport, generic IDs), health terms and
+  other credentials.
+- **Contextual checks** - values are only flagged near explicit context
+  (`call me at`, `my email is`, `card number`, `password is`, ...).
+- **Validation heuristics** - Luhn checksum for card numbers, digit-count
+  checks for phone numbers, plain-word rejection, already-masked rejection and
+  single-label email-domain rejection for UPI handles.
+
+Detection is deliberately conservative to avoid false positives.
+
+**Masking.** The `Masker` replaces every detected span in-place, preserving all
+surrounding context. Two mask styles:
+
+- **Star masks (same length):** OTP, password, PIN, recovery code, card, bank
+  account, UPI ID - e.g. `Your OTP is 482913` → `Your OTP is ******`.
+- **Bracket masks:** tokens, phone, email, address, ID, health and other
+  credentials - `[REDACTED_TOKEN]`, `[REDACTED_PHONE]`, `[REDACTED_EMAIL]`,
   `[REDACTED_ADDRESS]`, `[REDACTED_ID]`, `[REDACTED_HEALTH]`, `[REDACTED]`.
 
-**Notable bugs fixed in this task**
-1. `_phone_context_re` was compiled without `re.IGNORECASE`, so uppercase
-   `"Call me at ..."` / `"Contact Me On ..."` were missed.
-2. `_other_re` captured the word `are` instead of the credential for
-   `"credentials are admin:Passw0rd"`; added an `are` connector and a
-   colon-tolerant value class.
-3. `_upi_fmt_re` partial-matched real emails (`help@store` inside
-   `help@store.example.com`) causing false-positive UPI detections; added a
-   `(?!\.\w)` lookahead.
-4. `_is_address_value` re-detected an already-masked `[REDACTED_ADDRESS]`; added
-   redaction-marker rejection so masking is idempotent.
+**Risk levels.** Each sensitive type maps to a risk: `high` for credentials
+(OTP, password, PIN, token, recovery code, card, bank account, ID, health,
+other) and `medium` for contact/profile identifiers (UPI ID, phone, email,
+address).
 
-**Test coverage**: every sensitive type, multiple sensitive values in one
-message, false-positive-ish ordinary numbers, ordinary email/newsletter
-messages, already-masked messages (idempotent), case variations, empty input,
-security tests (raw values never appear in masked output, serialized detection,
-or public model dump), and a full-dataset leak scan.
+**Recommended actions.** Every detection carries a type-specific
+`recommended_action` (e.g. "Rotate the password and enable two-factor
+authentication.", "Do not share the one-time password; treat it as compromised
+if forwarded.").
 
-### 4.2 Task 2 — Hybrid message classification (DONE)
+> **Sensitive values are never intentionally written to logs, public API
+> responses, generated outputs, screenshots, or the demo UI.**
 
-One of exactly six categories per message, with confidence, reason and method.
+The raw matched value is stored only in a Pydantic `PrivateAttr` inside the
+internal `SensitiveDetection`, which is excluded from every serialization;
+public models (`PublicSensitiveDetection`, `MessageSensitiveResult`) carry only
+masked text. See [§22 Privacy/Security Notes](#22-privacysecurity-notes).
 
-**Files**
-- `app/models/classification.py`
-- `app/services/classifier.py`
-- `tests/test_classifier.py` — 35 tests
+## 7. Hybrid AI Architecture
 
-**Categories (`app/models/classification.py`)**
-`action_required`, `meeting_or_event`, `personal_information`,
-`general_information`, `promotional`, `sensitive_information`.
+The pipeline combines deterministic rules with an optional LLM fallback:
 
-`ClassificationResult`: `message_id`, `category`, `confidence` (float in
-`[0, 1]`), `reason` (short, truncated to 300 chars), `method`
-(`rule_based` | `llm_fallback`).
+- **Deterministic rules** run first for every message (classification scoring
+  and extraction regex rules). In the default configuration this is the only
+  path used - the pipeline is fully offline.
+- **LLM fallback** is used only when the deterministic result is not
+  confident enough:
+  - *Classifier:* rule confidence below `llm_confidence_threshold` (default
+    `0.75`).
+  - *Extractor:* no deterministic rule matched.
+- **Masked LLM input** - the LLM only ever receives `(message_id,
+  safe_message)` where `safe_message` is the fully masked text. The prompt
+  explicitly states that sensitive values are already masked and must not be
+  reconstructed.
+- **Structured LLM output** - the prompt mandates JSON. `parse_llm_response`
+  validates category/items, clamps confidence to `[0, 1]`, enforces known
+  types/priorities, validates dates and 24h times, checks the returned
+  `message_id`, and tolerates fenced or partially malformed JSON.
+- **Error handling** - a failed, empty or unusable LLM response returns `None`
+  from the provider, and the orchestrator falls back to the deterministic
+  result. Failures are counted in the pipeline summary. **A single LLM failure
+  never crashes the 900-message run.**
 
-**Pipeline (`app/services/classifier.py`)**
-1. Detect sensitive values → mask → the classifier only ever sees the sanitized
-   message.
-2. `RuleClassifier` — deterministic, context-aware scoring for action / meeting /
-   promotional / personal signals, plus a sensitive path when detections exist.
-   Scores below `_RULE_CONFIDENCE_FLOOR` fall back to `general_information`.
-3. If rule confidence >= `llm_confidence_threshold` the rule result is accepted.
-   Otherwise the LLM fallback is consulted; any failure falls back to the rule
-   result. **A single LLM failure never crashes the 900-message pipeline.**
+Providers are swappable (`MessageClassifierLLM` / `MessageExtractorLLM` ABCs).
+The bundled `OpenAIClassifierLLM` / `OpenAIExtractorLLM` call an
+OpenAI-compatible chat-completions endpoint with `temperature=0`. Without an
+enabled configuration, `build_llm_components` returns `(None, None)` and the
+LLM is never invoked.
 
-**LLM interface**
-- `MessageClassifierLLM` (ABC) — swappable provider; receives
-  `(message_id, safe_message)` only, returns a `ClassificationResult` or `None`.
-- `BaseLLMClassifier` — shared prompt building + robust parsing; subclasses
-  implement `_invoke(prompt) -> str`.
-- `parse_llm_response` — handles fenced JSON, malformed JSON, unknown category,
-  out-of-range / unparseable confidence (clamped), message_id mismatch, empty
-  responses.
-- The prompt mandates exactly one category, no invented facts, preserved
-  message_id, confidence in `[0, 1]`, short reason, and states that sensitive
-  values are already masked.
+## 8. Validation
 
-**Notable bugs fixed in this task**
-1. **Critical:** the LLM prompt template contained literal JSON braces, so
-   `str.format()` raised `KeyError` on every call and the LLM fallback silently
-   never ran. Braces were escaped.
-2. `MessageClassifier` did not catch provider exceptions; wrapped the LLM
-   invocation so one failing call falls back instead of crashing.
-3. `max(scores, key=scores.get)` mypy `arg-type` error → replaced with a lambda.
+Validation is strict - problems fail loudly instead of being silently written.
 
-### 4.3 Task 3 — Dataset ingestion + input validation (DONE)
+- **Input validation** (`validator.py`): the CSV must have exactly the required
+  columns (`message_id`, `timestamp`, `sender`, `message`), exactly the
+  expected size (900), unique non-empty message IDs, parseable timestamps, and
+  non-empty message/sender content in strictly chronological order. All issues
+  are reported at once with machine-readable codes.
+- **ID integrity** (`output_validator.py`): every artifact must contain every
+  expected message ID exactly once - missing, duplicated or invented IDs are
+  reported. Item IDs must be unique and each item's `source_message_id` must
+  match its message.
+- **Schema validation** - every artifact record must parse into its typed
+  Pydantic model; classification categories must be one of the six and
+  confidence must be in `[0, 1]`.
+- **Privacy leak detection** (`leak_scanner.py`): the scanner re-runs sensitive
+  detection on every original message and verifies that no raw matched value
+  appears anywhere in the serialized JSON of any artifact. Findings never
+  include the raw value - only message ID, artifact and sensitivity type.
+- **Mandatory ID validation** (`mandatory_demo.py`): the 15 mandatory IDs are
+  loaded from `mandatory_demo_ids.csv` (exact count, uniqueness), checked
+  against the dataset and the outputs, and served in dataset order. Missing
+  messages raise an error rather than fabricating a result.
 
-**Files**
-- `app/services/loader.py` — safe pandas loading, statistics, typed models
-- `app/services/validator.py` — all input validation rules
-- `app/models/message.py` — `RawMessage` (frozen)
-- `app/models/dataset.py` — `DatasetStatistics`
-- `app/config.py` — `Settings`, env-overridable paths, `pathlib`
-- `tests/test_validation.py` — 26 tests
+The consolidated `QualityReport` (written to `validation_report.json`) reports
+dataset integrity, valid categories/confidences, task/event count,
+sensitive-message count, mandatory demo coverage and the leak check, with an
+overall `validation_status` of `PASS` or `FAIL`.
 
-**`loader.load_messages_csv(path, *, expected_count=900, encoding='utf-8-sig')`**
-- Raises `DatasetLoadingError` for missing/unreadable/malformed files.
-- Never modifies the input CSV (read-only).
-- Returns `LoadedDataset(messages, statistics, source_path)`.
-- Independent of FastAPI.
+## 9. Project Structure
 
-**`validator.validate_dataset(df, *, expected_count)`**
-Validates: required columns; exact size; non-null, unique `message_id`;
-parseable timestamps; non-empty `message` and `sender`; chronological order.
-All problems are reported at once via `DatasetValidationError` containing
-`ValidationIssue(code, detail)` tuples with codes such as
-`missing_columns`, `unexpected_dataset_size`, `duplicate_message_id`,
-`empty_message_id`, `malformed_timestamp`, `not_chronological`,
-`missing_message_content`, `missing_sender`.
-
-**`loader.dataset_statistics(messages)`** returns `DatasetStatistics`:
-`total_messages`, `unique_message_ids`, `earliest_timestamp`,
-`latest_timestamp`, `empty_message_count`, `empty_sender_count`.
-
-### 4.4 Task 4 — Task/event extraction (DONE)
-
-Extracts tasks, meetings, events and reminders from sanitized messages.
-
-**Files**
-- `app/models/task_event.py` — `ItemType` (`task | meeting | event | reminder`),
-  `Priority` (`low | medium | high | unknown`), `ExtractedItem` (frozen),
-  `ExtractorMethod`, `ExtractionResult`.
-- `app/services/extractor.py` — `ExtractionRules`, LLM interface, `MessageExtractor`.
-- `tests/test_extraction.py` — 84 tests
-
-**Fields** (`ExtractedItem`): `item_id`, `type`, `title`, `description`, `date`,
-`deadline`, `time` (24h `HH:MM`), `person`, `priority`, `source_message_id`.
-Fields genuinely unavailable are `null` / `unknown` — nothing is fabricated.
-
-**Item IDs** are deterministic and derived from the source message:
-`<TYPE>_<message_id>`, e.g. `TASK_MSG_0002`, `EVENT_MSG_0007`. When one message
-yields several items of the same type they are indexed with a `-N` suffix
-(`TASK_MSG_0002-2`, `TASK_MSG_0002-3`). The format is covered by dedicated unit
-tests and asserted across the whole dataset (`make_item_id`).
-
-**Relative-date resolution** — relative expressions (`today`, `tomorrow`,
-`yesterday`, bare or qualified weekdays, `in <n> days`) are resolved against
-**the message timestamp**, never the current system date
-(`resolve_relative_date` + `extract_from_safe(..., reference_date=...)`, where
-the reference is `message.timestamp.date()`). Vague or conditional phrasing
-(`could be Friday`, `may be needed tomorrow`, `sometime next week`) is never
-turned into a definite date. Explicit ISO dates need no reference.
-
-**Deterministic rules** (`ExtractionRules`), evaluated in precedence order:
-1. `Calendar update: <title>, <date> at <time>, <loc>` → `event`
-2. `Reminder: <title> happens on <date> at <time> in <loc>` → `reminder`
-3. `The <title> is scheduled for <date> at <time> in <loc>` → `meeting`
-4. `Please join the <title> on <date>, <time> at <loc>` → `event`
-5. `Are you available for the <title> at <time> on <date>? Location: ...` → `meeting`
-6. **Missing-time variants** of 1–3 (explicit date, no time) → the same item with
-   `time=None` — the time is never guessed.
-7. Explicit deadline (`by|before|deadline is|is due on|due on` + date) → `task`
-   with the deadline captured and a clean action title
-8. **Multi-task rule** — a message with several distinct explicit deadlines
-   yields one task per deadline (with `-2`, `-3`, ... suffixes); each title is
-   split from the text between consecutive deadlines.
-9. `Please call <Name>` / `call the <target>` → `task` with `person` where a name
-   is present
-
-Times are normalized to 24h `HH:MM` (`9 AM` → `09:00`, `8 pm` → `20:00`).
-Priority is `high` only for explicit urgency words, `low` for flexibility
-signals, else `unknown`. Message prefixes (`For today:`, `FYI:`, ...) and
-polite softeners (`please`, `could you`, `i need you to`, ...) are stripped from
-task titles.
-
-**LLM interface** (same pattern as the classifier):
-- `MessageExtractorLLM` (ABC) — receives `(message_id, safe_message)` only,
-  returns items or `None` on any failure.
-- `BaseLLMExtractor` — shared prompt + robust parsing.
-- `parse_llm_response` — accepts `{"items": [...]}` or a bare list; validates
-  types/dates/times; rejects unknown types, empty titles, bad dates/times and
-  `message_id` mismatches; indexes repeated item types (`-2`, `-3`, ...).
-
-**Pipeline** (`MessageExtractor`): mask → deterministic rules; LLM fallback only
-when nothing matched; a single LLM failure never crashes the pipeline.
-
-### 4.5 Task 5 — Pipeline runner + output validation + leak scan (DONE)
-
-**Files**
-- `app/models/pipeline.py` — `MessageSensitiveResult` (public, `extra="forbid"`),
-  `MessagePipelineResult` (carries `timestamp` + `sender`),
-  `FinalMessageResult` (sanitized per-message output), `PipelineSummary`
-  (failure counter + processing duration), `PipelineRunResult`.
-- `app/services/pipeline.py` — `PipelineRunner` (detect → mask → classify →
-  extract) with LLM failure counters and processing duration.
-- `app/services/output_validator.py` — per-artifact validation +
-  `QualityReport` (the `validation_report.json` structure).
-- `app/services/leak_scanner.py` — `LeakScanner`, findings never carry raw values.
-- `app/services/mandatory_demo.py` — mandatory 15-ID demo coverage.
-- `app/services/llm_provider.py` — optional HTTP (OpenAI-compatible) clients.
-- `scripts/run_pipeline.py` — writes the five JSON artifacts.
-- `tests/test_pipeline.py` (17) · `tests/test_output_validator.py` (32) ·
-  `tests/test_mandatory_demo.py` (14)
-
-**`scripts/run_pipeline.py`** (run with `python -m scripts.run_pipeline`) loads
-the dataset, runs every stage, and writes to `outputs/`:
-1. `classifications.json` — per-message `ClassificationResult`
-2. `tasks_events.json` — per-message `ExtractionResult`
-3. `sensitive_detections.json` — per-message public detections (masked only)
-4. `final_results.json` — sanitized per-message `FinalMessageResult`
-   (`message_id`, `timestamp`, `sender`, `classification`, `security`,
-   `extracted_items`; deliberately no raw message text)
-5. `validation_report.json` — run summary + `QualityReport` + leak scan
-
-Exit code 0 on success, 1 when validation or the leak scan fails.
-
-**Output validation** (`output_validator.py`): every record must parse into its
-typed Pydantic model; every message ID preserved exactly once (missing /
-duplicate / unknown IDs reported); item IDs unique; item `source_message_id`
-matches its message; classification category is one of the six and confidence is
-in `[0, 1]`. `build_quality_report` produces the consolidated `QualityReport`:
-dataset integrity (900 in / 900 out), valid categories/confidences, task/event
-count, sensitive-message count, mandatory demo coverage and the leak check.
-
-**Mandatory demo** (`mandatory_demo.py`): loads the 15 required IDs from
-`mandatory_demo_ids.csv` (validating count and uniqueness), checks them against
-the dataset and pipeline outputs (`MandatoryDemoCheck`), and serves the complete
-processed results for exactly those messages in original dataset chronological
-order (`MandatoryDemoService.build`). Missing messages raise instead of ever
-fabricating a result.
-
-**Leak scan** (`leak_scanner.py`): re-runs sensitive detection on each original
-message and verifies no raw matched value appears in any artifact's JSON text.
-`LeakFinding` stores message_id, artifact, sensitivity_type only.
-
-**LLM providers** (`llm_provider.py`): optional OpenAI-compatible HTTP clients
-for both classifier and extractor; they only ever receive the masked message.
-`build_llm_components(settings)` returns `(None, None)` — fully offline —
-unless the LLM fallback is enabled with a key and model configured.
-
-### 4.6 Cross-cutting work
-
-- Enums migrated from `str, Enum` to `StrEnum` (ruff `UP042`).
-- Line-length (100) formatting fixes across touched files.
-- `app/config.py` extended with configurable LLM settings and an offline mode
-  (default: `llm_enabled=False` → fully deterministic, no external calls).
-- Full repo passes `ruff check .` and `mypy app tests scripts`.
-- New modules follow the frozen-Pydantic / ABC-provider conventions of earlier
-  tasks; the `date` model field is annotated via `from datetime import date as
-  Date` to avoid class-namespace shadowing.
-
-### 4.7 Dataset encryption (privacy) (DONE)
-
-**Files**
-- `app/services/dataset_cipher.py` — Fernet helpers + `prepare_datasets`
-- `scripts/encrypt_dataset.py` — encrypts plaintext CSVs into `data/*.enc`
-- `tests/test_dataset_cipher.py` — 8 tests
-
-The assignment forbids publishing the dataset in a public repository, so the
-plaintext CSVs are never tracked. Instead:
-- `scripts/encrypt_dataset.py` encrypts `messages.csv` and
-  `mandatory_demo_ids.csv` into `data/messages.csv.enc` and
-  `data/mandatory_demo_ids.csv.enc` and verifies a byte-identical round trip.
-- The key comes from the `DATASET_ENC_KEY` environment variable or the
-  gitignored `data/.dataset.key` file (`--new-key` forces a fresh key).
-- `prepare_datasets(settings)` (called at the start of
-  `python -m scripts.run_pipeline`) decrypts a plaintext CSV back into place
-  exactly when it is missing, so a fresh clone can regenerate the dataset
-  before the pipeline runs.
-- On Render the key is a dashboard secret (`DATASET_ENC_KEY` in `render.yaml`),
-  never committed.
-
-### 4.8 Task 6 — FastAPI dashboard (DONE)
-
-**Files**
-- `app/main.py` — FastAPI app: dashboard + sanitized read API
-- `app/models/api.py` — response models
-- `app/services/api_service.py` — filtering/pagination/stats/mandatory demo
-- `app/services/output_repository.py` — typed reads of the `outputs/` artifacts
-- `app/templates/dashboard.html`, `app/templates/base.html` — dashboard UI
-- `app/static/app.js`, `app/static/styles.css` — client assets
-- `tests/test_api.py` — 24 tests
-
-The app is a thin presentation layer over the validated pipeline artifacts:
-`GET /` (dashboard), `GET /health`, `/api/stats`, `/api/messages`,
-`/api/messages/{id}`, `/api/tasks`, `/api/sensitive`, `/api/demo/mandatory`,
-`/api/validation`. Responses only ever serialize the pipeline's sanitized
-models; the raw message text and sensitive values never reach the API.
-`app = create_app()` at module import; run with `uvicorn app.main:app`.
-
-## 5. Security rules
-
-- Raw sensitive values exist **only** in `SensitiveDetection` private
-  attributes; they are excluded from every serialization.
-- Never write raw sensitive values to logs, JSON artifacts, API responses,
-  frontend, screenshots, or generated reports.
-- The LLM (when configured) only ever receives the masked/sanitized message.
-- The plaintext dataset CSVs and the Fernet key (`DATASET_ENC_KEY`,
-  `data/.dataset.key`) are never committed or logged; only the encrypted
-  `data/*.enc` blobs live in the repository.
-- `.env` and `outputs/*.json` are gitignored; API keys and secrets must never be
-  committed.
-
-## 6. Verification status (latest run)
-
-| Check | Result |
-| --- | --- |
-| `pytest` | **322 passed** (26 validation + 82 sensitive + 35 classifier + 84 extraction + 32 output validation/leak + 17 pipeline + 14 mandatory demo + 8 dataset cipher + 24 API) |
-| `ruff check .` | All checks passed |
-| `mypy app tests scripts` | No issues found in 38 source files |
-| `python -m scripts.run_pipeline` | 900 messages · 360 items extracted (60 event / 60 meeting / 30 reminder / 210 task) · 100 sensitive messages · 15/15 mandatory demo · 0 validation issues · 0 leaks · ~0.2s · validation PASS |
-
-Commands:
-
-```bash
-python -m pytest
-python -m pytest tests/test_validation.py -v
-python -m pytest tests/test_sensitive.py -v
-python -m pytest tests/test_classifier.py -v
-python -m pytest tests/test_extraction.py -v
-python -m pytest tests/test_output_validator.py -v
-python -m pytest tests/test_pipeline.py -v
-python -m pytest tests/test_mandatory_demo.py -v
-python -m pytest tests/test_dataset_cipher.py -v
-python -m pytest tests/test_api.py -v
-ruff check .
-mypy app tests scripts
-python -m scripts.encrypt_dataset        # (re)create data/*.enc from plaintext CSVs
-python -m scripts.run_pipeline           # decrypt-on-demand, then process
-uvicorn app.main:app                     # local dashboard
+```
+message_intelligence/
+├── app/
+│   ├── main.py                    # FastAPI app: dashboard + read-only API
+│   ├── config.py                  # Settings, env-overridable paths
+│   ├── models/
+│   │   ├── api.py                 # API response models
+│   │   ├── classification.py      # Category, ClassificationResult
+│   │   ├── dataset.py             # DatasetStatistics
+│   │   ├── message.py             # RawMessage
+│   │   ├── pipeline.py            # MessagePipelineResult, FinalMessageResult
+│   │   ├── sensitive.py           # SensitiveType, risk, public/internal models
+│   │   └── task_event.py          # ExtractedItem, ItemType, Priority
+│   ├── services/
+│   │   ├── api_service.py         # Dashboard/API business logic
+│   │   ├── classifier.py          # RuleClassifier + MessageClassifierLLM
+│   │   ├── dataset_cipher.py      # Fernet encrypt/decrypt + prepare_datasets
+│   │   ├── extractor.py           # ExtractionRules + MessageExtractorLLM
+│   │   ├── leak_scanner.py        # Sensitive-value leak scan of artifacts
+│   │   ├── llm_provider.py        # Optional OpenAI-compatible clients
+│   │   ├── loader.py              # CSV loading + typed messages
+│   │   ├── mandatory_demo.py      # 15 mandatory IDs validation/serving
+│   │   ├── masker.py              # In-place masking
+│   │   ├── output_repository.py   # Typed reads of outputs/*.json
+│   │   ├── output_validator.py    # Artifact validation + QualityReport
+│   │   ├── pipeline.py            # End-to-end orchestrator
+│   │   ├── sensitive_detector.py  # Sensitive-value detection
+│   │   └── validator.py           # Input dataset validation
+│   ├── static/
+│   │   ├── app.js                 # Dashboard client logic
+│   │   └── styles.css
+│   └── templates/
+│       ├── base.html
+│       └── dashboard.html
+├── data/
+│   ├── messages.csv.enc           # Encrypted dataset blob (committed)
+│   └── mandatory_demo_ids.csv.enc # Encrypted mandatory IDs blob (committed)
+├── outputs/
+│   └── .gitkeep                   # Generated JSON artifacts (gitignored)
+├── scripts/
+│   ├── encrypt_dataset.py         # Encrypt plaintext CSVs into data/*.enc
+│   └── run_pipeline.py            # Run the full pipeline -> outputs/*.json
+├── tests/                         # 322 tests across 9 files
+│   ├── test_api.py
+│   ├── test_classifier.py
+│   ├── test_dataset_cipher.py
+│   ├── test_extraction.py
+│   ├── test_mandatory_demo.py
+│   ├── test_output_validator.py
+│   ├── test_pipeline.py
+│   ├── test_sensitive.py
+│   └── test_validation.py
+├── .env.example                   # Documented environment variables
+├── .gitignore
+├── .python-version                # 3.14.3
+├── pyproject.toml                 # Project metadata + dev tooling config
+├── render.yaml                    # Render Blueprint
+├── requirements.txt               # Runtime dependencies
+├── uv.lock                        # Locked dependency tree
+├── README.md                      # This document
+└── README.txt                     # Assignment brief (unchanged)
 ```
 
-## 7. Configuration
+The plaintext `messages.csv` and `mandatory_demo_ids.csv` and the local key
+file `data/.dataset.key` exist in the working copy but are **gitignored** -
+only the encrypted blobs are committed.
 
-Paths and thresholds are configurable via environment variables (see
-`app/config.py`), never hardcoded:
+## 10. Installation
 
-| Env var | Default | Purpose |
+Requirements: **Python 3.14+** (the repo pins `3.14.3`). [uv](https://docs.astral.sh/uv/)
+is recommended because the lockfile is included, but plain `pip` works too.
+
+```bash
+# Clone / copy the project folder, then from the project root:
+
+# Option A - uv (recommended; installs runtime + dev deps from uv.lock)
+uv sync
+
+# Option B - pip
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # Linux/macOS
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install pytest ruff mypy   # dev dependencies
+```
+
+The dataset key is a secret. The shared working copy already contains the
+gitignored plaintext CSVs and the local key file (`data/.dataset.key`). On a
+fresh machine, provide the key via the `DATASET_ENC_KEY` environment variable,
+or regenerate the blobs with `python -m scripts.encrypt_dataset` (which also
+creates the local key file).
+
+## 11. Environment Variables
+
+All settings come from the process environment (see `app/config.py`).
+`.env.example` documents every variable. Copy it to `.env` as a reference and
+export the values you change; the key must be set as an environment variable or
+in the gitignored `data/.dataset.key` file. **Never include real credentials in
+the repository.**
+
+| Variable | Default | Purpose |
 | --- | --- | --- |
 | `MESSAGES_CSV_PATH` | `./messages.csv` | Input dataset (decrypted on demand) |
 | `MANDATORY_DEMO_IDS_PATH` | `./mandatory_demo_ids.csv` | 15 demo-required IDs |
 | `OUTPUTS_DIR` | `./outputs` | Generated JSON artifacts |
 | `ENCRYPTED_DATA_DIR` | `./data` | Committed `*.enc` Fernet blobs |
 | `DATASET_KEY_FILE` | `./data/.dataset.key` | Local gitignored Fernet key file |
-| `DATASET_ENC_KEY` | *(empty)* | Fernet key secret; Render dashboard env var |
+| `DATASET_ENC_KEY` | *(empty)* | Fernet key secret (Render dashboard env var) |
 | `EXPECTED_MESSAGE_COUNT` | `900` | Exact expected dataset size |
 | `EXPECTED_MANDATORY_COUNT` | `15` | Exact expected mandatory-ID count |
-| `LLM_ENABLED` | `false` | Offline mode; when false the pipeline is fully deterministic |
+| `LLM_ENABLED` | `false` | Offline mode; when `false` the pipeline is fully deterministic |
 | `LLM_PROVIDER` | `openai` | Provider name (OpenAI-compatible) |
 | `LLM_MODEL` | *(empty)* | Model identifier sent to the provider |
 | `LLM_API_KEY` | *(empty)* | Secret key; never logged or serialized |
@@ -443,23 +423,203 @@ Paths and thresholds are configurable via environment variables (see
 | `LLM_TIMEOUT_SECONDS` | `30` | Timeout for a single LLM request |
 | `LLM_CONFIDENCE_THRESHOLD` | `0.75` | Rule confidence below which the LLM fallback is consulted |
 
-Copy `.env.example` to `.env` for local overrides (the pipeline reads
-environment variables directly; `python-dotenv` is available).
+## 12. Running Locally
 
-## 8. Deployment (Render) — ready to ship
+```bash
+# 1. Ensure the dataset is available (decrypts on demand if missing)
+python -m scripts.run_pipeline
 
-The dashboard and API are implemented and the `render.yaml` Blueprint is wired.
+# 2. Start the dashboard (serves the sanitized API + UI)
+uvicorn app.main:app --reload
+# then open http://127.0.0.1:8000
+```
 
-1. The GitHub repository must stay **private** (the assignment forbids
-   publishing the dataset; only encrypted blobs are committed).
-2. Generate the dataset key once: `python -m scripts.encrypt_dataset`. Copy the
-   printed Fernet key into the Render dashboard as the `DATASET_ENC_KEY` secret
-   (keep `sync: false` in `render.yaml`; never commit it).
-3. Push `main`. Render Blueprint builds with `pip install -r requirements.txt`
-   (Python `3.14.3`, from `.python-version`) and starts with
-   `python -m scripts.run_pipeline && uvicorn app.main:app --host 0.0.0.0 --port $PORT`,
-   which decrypts the dataset, regenerates the artifacts, and serves the
-   dashboard. No external services or LLM calls are required.
+Interactive API docs are available at `/docs` and `/redoc`.
 
-Do not hardcode classifications or extractions for individual message IDs.
-Preserve original message IDs; never silently drop or duplicate messages.
+## 13. Running the Pipeline
+
+```bash
+python -m scripts.run_pipeline
+```
+
+This loads and validates the dataset, decrypts the CSVs from `data/*.enc` on
+demand if the plaintext files are missing, runs detection → masking →
+classification → extraction over all 900 messages, and writes
+`outputs/*.json`. The exit code is `0` on success and `1` when validation or
+the leak scan fails.
+
+## 14. Running Tests
+
+```bash
+python -m pytest            # 322 tests
+python -m ruff check .      # lint
+python -m mypy app tests scripts   # type checking
+```
+
+The test suite covers input validation, sensitive detection (including
+security/leak tests), classification, extraction, output validation, pipeline
+orchestration, mandatory demo coverage, the dataset cipher, and the API.
+
+## 15. API Endpoints
+
+All responses are sanitized Pydantic models; raw sensitive values never appear.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/` | Single-page dashboard (HTML). |
+| `GET` | `/health` | Liveness check: `{"status": "ok"}`. |
+| `GET` | `/api/stats` | Aggregate statistics (counts only, no content). |
+| `GET` | `/api/messages` | Paginated message list with `search`, `category`, `sensitive`, `limit`, `offset` filters. |
+| `GET` | `/api/messages/{message_id}` | Full sanitized detail for one message. |
+| `GET` | `/api/tasks` | Extracted items with `type`, `priority`, `date_from`, `date_to`, `limit`, `offset` filters. |
+| `GET` | `/api/sensitive` | Sanitized sensitive detections (masked values only). |
+| `GET` | `/api/demo/mandatory` | The 15 mandatory demo messages in dataset order. |
+| `GET` | `/api/validation` | The validation report (summary, quality report, leak scan). |
+
+Pagination defaults to `limit=100`; message/sensitive lists cap at 900 and the
+tasks list at 2000.
+
+## 16. Output Files
+
+`python -m scripts.run_pipeline` writes these files to `outputs/` (gitignored,
+regenerated on every run):
+
+- **`classifications.json`** - one `ClassificationResult` per message
+  (`message_id`, `category`, `confidence`, `reason`, `method`).
+- **`tasks_events.json`** - one `ExtractionResult` per message (`message_id`,
+  `items`, `method`, `reason`); `items` is a list of validated
+  `ExtractedItem`s.
+- **`sensitive_detections.json`** - one sanitized `MessageSensitiveResult` per
+  message (`message_id`, `has_detection`, `detections`). Detections contain
+  masked text and never a raw value.
+- **`final_results.json`** - one sanitized `FinalMessageResult` per message
+  (`message_id`, `timestamp`, `sender`, `safe_message`, `classification`,
+  `security`, `extracted_items`). This artifact deliberately carries the
+  masked message, never raw text.
+- **`validation_report.json`** - the run summary, the consolidated
+  `QualityReport`, the leak-scan result and the overall `validation_status`.
+
+A `summary_statistics.json` is also written with aggregate counts only
+(totals, items by type, classification methods, failures, leak check).
+
+## 17. Deployment
+
+The repository includes a `render.yaml` Blueprint. Render builds from the repo,
+runs the pipeline, and serves the dashboard:
+
+```yaml
+services:
+  - type: web
+    name: message-intelligence
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.run_pipeline && uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATASET_ENC_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.14.3
+```
+
+Steps:
+
+1. Keep the GitHub repository **private** (the assignment forbids publishing
+   the dataset; only encrypted blobs are committed).
+2. Set the Fernet key as the `DATASET_ENC_KEY` secret in the Render dashboard
+   (`sync: false` means you enter the value there; it is never committed).
+3. Push `main`. Render installs `requirements.txt` (Python `3.14.3`), the start
+   command decrypts the dataset, regenerates the artifacts, and serves the app.
+   No external services or LLM calls are required.
+
+## 18. Demo
+
+The demo must show the 15 message IDs listed in `mandatory_demo_ids.csv`. The
+"Mandatory Demo" section of the dashboard does this automatically:
+
+- The IDs are loaded from the CSV at runtime - **never hardcoded** - and
+  validated for count and uniqueness.
+- Each mandatory message is shown with its classification (category,
+  confidence, method), its extracted task/event, and a masked-content preview.
+- Results are displayed in the **original dataset chronological order**.
+- If any mandatory message were missing from the outputs, the service raises
+  instead of showing a fabricated result.
+
+The same data is available via `GET /api/demo/mandatory`.
+
+## 19. Assumptions
+
+The following assumptions reflect the implementation:
+
+- The input is a UTF-8 (BOM) CSV with exactly the columns `message_id`,
+  `timestamp`, `sender`, `message`, exactly 900 rows, unique IDs and strictly
+  chronological timestamps (all enforced by validation).
+- Each message is processed independently and yields exactly one
+  classification and zero or more extracted items.
+- The **message timestamp** is the reference for resolving relative dates; the
+  system clock is never used.
+- A message may yield several tasks only when it contains several explicit
+  deadlines; otherwise exactly one item per matching rule.
+- Editorial prefixes (`For today:`, `FYI:`, ...) are message prefixes, not date
+  constraints, and are stripped from titles.
+- A field is populated only when explicitly stated; everything else stays
+  `null`/`unknown`.
+- Fictional data is handled with the same privacy rigor as real data.
+- The mandatory demo IDs come from `mandatory_demo_ids.csv`, never from code.
+- The LLM fallback is optional; the default run is fully deterministic
+  (rule-based) and offline.
+
+## 20. Limitations
+
+- **Synthetic dataset** - the 900 messages are fictional and hand-crafted, so
+  real-world phrasing variety is not fully represented.
+- **Regex limitations** - detection and extraction are regex/rule based.
+  Novel phrasings may be missed; the conservative design avoids false positives
+  at the cost of some under-detection.
+- **LLM ambiguity** - when enabled, free-text LLM responses are parsed
+  strictly; malformed or inconsistent responses are discarded and the
+  deterministic result is kept.
+- **Relative date ambiguity** - vague or conditional phrases (`could be
+  Friday`, `sometime next week`) are intentionally not resolved into definite
+  dates and stay `null`.
+- **Contextual sensitivity detection** - only values that appear near explicit
+  context or in exact formats are flagged (e.g. a bare phone number without any
+  context is not detected). Detection is best-effort and not guaranteed to be
+  exhaustive.
+
+## 21. AI Tool Usage Declaration
+
+- **AI coding tools** were used to develop this project: to design and
+  implement the pipeline modules, write and run tests, review code, and produce
+  documentation. All generated code was executed, tested and verified as part
+  of the repository's test suite.
+- **LLM APIs (pipeline feature):** the pipeline includes an optional LLM
+  fallback (classifier/extractor). It is **disabled by default** (`LLM_ENABLED`
+  defaults to `false`) and was **not used** during development or runs. When
+  enabled it would receive only the **masked** message text - never raw
+  sensitive values - via an OpenAI-compatible endpoint configured by the user.
+- **Dataset privacy:** the assignment dataset was never uploaded to or
+  processed by any external AI service. All pipeline runs were fully offline
+  and deterministic.
+
+## 22. Privacy/Security Notes
+
+- **Masking policy** - sensitive values are detected and masked *before* any
+  downstream stage: classification, extraction, the LLM, the API, the UI and
+  the JSON artifacts only ever see masked text.
+- **Internal-only raw values** - the raw matched value lives in a Pydantic
+  `PrivateAttr` of the internal `SensitiveDetection`, which is excluded from
+  `model_dump()`/`model_dump_json()`. Public models and API responses never
+  contain a raw value; `MessageSensitiveResult` uses `extra="forbid"` so a
+  stray raw field cannot sneak into an artifact.
+- **Leak scan** - every run re-detects sensitive values in the original
+  messages and verifies none appear in any artifact's JSON; findings record
+  only message ID, artifact and sensitivity type.
+- **Dataset at rest** - the plaintext CSVs and the Fernet key are gitignored;
+  only encrypted `data/*.enc` blobs are committed. The key is supplied at
+  build/start time via `DATASET_ENC_KEY` or the local `data/.dataset.key`.
+- **Logging/reporting** - no pipeline stage logs or serializes raw sensitive
+  values; `final_results.json` and the API serve only the masked message.
+- **Secrets** - API keys and secrets are never committed, logged or included in
+  responses.
